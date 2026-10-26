@@ -1,0 +1,6 @@
+# Full snapshot of wqb_cli stays on disk only (187MB of API inventory).
+# The live install under site-packages is the source of truth; this repo
+# carries the audit trail (README + idempotent reapply script).
+wqb_cli/
+*.sqlite3*
+local/
