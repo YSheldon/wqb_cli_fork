@@ -1,7 +1,8 @@
-"""Reapply the two local wqb_cli sqlitesimu patches, idempotently.
+"""Reapply the local wqb_cli 0.6.1 sqlitesimu slot-cap patch, idempotently.
 
-Patch 1 (runtime.py): cap concurrent simulation batches at 4 (GLB account wall).
-Patch 2 (db.py): dedupe repeated check names returned by /alphas/{id}.
+Patch (runtime.py): cap concurrent simulation batches at 4 (GLB account wall).
+No checks-dedupe patch needed on 0.6.1: alpha_checks schema v6 keys rows by
+(alpha_id, ordinal), so repeated check names no longer violate a UNIQUE index.
 
 Run:  python reapply_patches.py [--target PATH_TO_SITE_PACKAGES_WQB_CLI]
 """
@@ -11,34 +12,17 @@ import argparse
 import sys
 from pathlib import Path
 
-RUNTIME_ANCHOR = """        experiment = self.store.next_enrichment(run_id, now=now)
-        if experiment:
-            self._enrich(experiment, now=now)
-            return True
-
+STEP_ANCHOR = """    def _step_simulation(self, run_id: str, *, now: float) -> bool:
         batch = self.store.next_simulate_batch(run_id, now=now)"""
 
-RUNTIME_PATCHED = """        experiment = self.store.next_enrichment(run_id, now=now)
-        if experiment:
-            self._enrich(experiment, now=now)
-            return True
-
+STEP_PATCHED = """    def _step_simulation(self, run_id: str, *, now: float) -> bool:
         if self._inflight_slots(run_id) >= 4:
             return False
-
         batch = self.store.next_simulate_batch(run_id, now=now)"""
 
-RUNTAIL_ANCHOR = """        if self.store.create_next_batch(run_id, now=now):
-            return True
-        return False
+METHOD_ANCHOR = """    def _simulate(self, batch: BatchRecord, *, now: float) -> None:"""
 
-    def _simulate(self, batch: BatchRecord, *, now: float) -> None:"""
-
-RUNTAIL_PATCHED = """        if self.store.create_next_batch(run_id, now=now):
-            return True
-        return False
-
-    def _inflight_slots(self, run_id: str) -> int:
+METHOD_PATCHED = """    def _inflight_slots(self, run_id: str) -> int:
         with self.store.connect() as conn:
             row = conn.execute(
                 \"\"\"
@@ -50,33 +34,6 @@ RUNTAIL_PATCHED = """        if self.store.create_next_batch(run_id, now=now):
         return int(row[0])
 
     def _simulate(self, batch: BatchRecord, *, now: float) -> None:"""
-
-DB_ANCHOR = """            conn.execute("DELETE FROM alpha_checks WHERE alpha_id = ?", (alpha_id,))
-            for check in checks if isinstance(checks, list) else []:
-                if not isinstance(check, dict) or not check.get("name"):
-                    continue
-                conn.execute("""
-
-DB_PATCHED = """            conn.execute("DELETE FROM alpha_checks WHERE alpha_id = ?", (alpha_id,))
-            seen_check_names: set[str] = set()
-            for check in checks if isinstance(checks, list) else []:
-                if not isinstance(check, dict) or not check.get("name"):
-                    continue
-                check_name = str(check["name"])
-                if check_name in seen_check_names:
-                    continue
-                seen_check_names.add(check_name)
-                conn.execute("""
-
-DB_NAME_ANCHOR = """                    (
-                        alpha_id,
-                        str(check["name"]),
-                        check.get("result"),"""
-
-DB_NAME_PATCHED = """                    (
-                        alpha_id,
-                        check_name,
-                        check.get("result"),"""
 
 
 def apply(text: str, anchor: str, patched: str, label: str) -> tuple[str, str]:
@@ -95,23 +52,16 @@ def main() -> int:
     )
     args = parser.parse_args()
     target = Path(args.target)
-    log = []
 
     runtime = target / "sqlitesimu" / "runtime.py"
-    text, status = apply(runtime.read_text(encoding="utf-8"), RUNTIME_ANCHOR, RUNTIME_PATCHED, "runtime slots cap")
-    text, status2 = apply(text, RUNTAIL_ANCHOR, RUNTAIL_PATCHED, "runtime _inflight_slots")
-    log += [status, status2]
+    text = runtime.read_text(encoding="utf-8")
+    text, status1 = apply(text, STEP_ANCHOR, STEP_PATCHED, "runtime 4-slot cap")
+    text, status2 = apply(text, METHOD_ANCHOR, METHOD_PATCHED, "runtime _inflight_slots")
     runtime.write_text(text, encoding="utf-8")
 
-    db = target / "sqlitesimu" / "db.py"
-    text, status = apply(db.read_text(encoding="utf-8"), DB_ANCHOR, DB_PATCHED, "db checks dedupe")
-    text, status2 = apply(text, DB_NAME_ANCHOR, DB_NAME_PATCHED, "db check name reuse")
-    log += [status, status2]
-    db.write_text(text, encoding="utf-8")
-
-    for line in log:
+    for line in (status1, status2):
         print(line)
-    if any("ANCHOR NOT FOUND" in line for line in log):
+    if "ANCHOR NOT FOUND" in (status1, status2):
         return 1
     return 0
 
